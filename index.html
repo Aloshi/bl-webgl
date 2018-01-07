@@ -1,0 +1,436 @@
+<html>
+
+<head>
+<title>Blockland BLS Renderer | aloshi.com</title>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8"> <!charset=ISO-8859-1">
+
+<script type="text/javascript" src="jquery/jquery.js"></script>
+<script type="text/javascript" src="gl-matrix/gl-matrix-min.js"></script>
+<script type="text/javascript" src="blbreader.js"></script>
+<script type="text/javascript" src="blsreader.js"></script>
+
+<script id="shader-fs" type="x-shader/x-fragment">
+    precision mediump float;
+	
+	varying vec3 v_position;
+	varying vec3 v_normal;
+	
+	uniform vec4 u_color;
+	
+    void main(void)
+    {
+		vec3 lightPosition = vec3(50, 0, 0);
+		
+		vec3 lightVector = lightPosition - v_position;
+
+		vec3 N = normalize(v_normal);
+		vec3 L = normalize(lightVector);
+		vec3 E = normalize(-v_position);
+		vec3 R = normalize(-reflect(L, N));
+
+		vec4 diffuseTerm = u_color * (max(dot(N,L), 0.0) + 1.0);
+		diffuseTerm = clamp(diffuseTerm, 0.0, 1.0); 
+
+		//this is for specular; you could turn it on (uncomment this and in + specularTerm in gl_FragColor=),
+		//but it doesn't really fit Blockland's shading
+		//likewise, the '1.0 1.0 1.0 1.0' vec4 here is specular color
+		//vec4 specularTerm = vec4(1.0, 1.0, 1.0, 1.0) * pow(max(dot(R,E),0.0), 75.0);
+		//specularTerm = clamp(specularTerm, 0.0, 1.0); 
+
+		gl_FragColor = diffuseTerm /*+ specularTerm*/;
+    }
+</script>
+
+<script id="shader-vs" type="x-shader/x-vertex">
+	precision mediump float;
+	attribute vec4 a_position;
+	attribute vec3 a_normal;
+	
+	varying vec3 v_position;
+	varying vec3 v_normal;
+	
+	uniform mat4 uMVMatrix;
+	uniform mat4 uPMatrix;
+	
+	uniform vec4 u_color;
+
+    void main(void)
+    {
+		v_position = vec3(uMVMatrix * a_position);
+		v_normal = vec3(uMVMatrix * vec4(a_normal, 0.0));
+        gl_Position = uPMatrix * uMVMatrix * a_position;
+    }
+</script>
+
+
+<script type="text/javascript">
+	/**
+	 * Created by Alec "Aloshi" Lofquist.
+	**/
+
+	//initialization stuff
+	//**********************************************************************************************
+    var gl;
+    function initGL(canvas)
+    {
+        try
+		{
+            gl = canvas.getContext("experimental-webgl");
+            gl.viewportWidth = canvas.width;
+            gl.viewportHeight = canvas.height;
+        } catch (e) { }
+		
+        if (!gl)
+		{
+            alert("Could not initialize WebGL. You should try a different browser.");
+        }
+    }
+
+    function getShader(gl, id)
+    {
+        var shaderScript = document.getElementById(id);
+        if (!shaderScript)
+        {
+            return null;
+        }
+
+        var str = "";
+        var k = shaderScript.firstChild;
+        while (k)
+        {
+            if (k.nodeType == 3) {
+                str += k.textContent;
+            }
+            k = k.nextSibling;
+        }
+
+        var shader;
+        if (shaderScript.type == "x-shader/x-fragment")
+        {
+            shader = gl.createShader(gl.FRAGMENT_SHADER);
+        } else if (shaderScript.type == "x-shader/x-vertex") {
+            shader = gl.createShader(gl.VERTEX_SHADER);
+        } else {
+            return null;
+        }
+
+        gl.shaderSource(shader, str);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+        {
+            console.log("failed to compile shader: " + gl.getShaderInfoLog(shader));
+            return null;
+        }
+
+        return shader;
+    }
+
+    var shaderProgram;
+
+    function initShaders()
+    {
+        var fragmentShader = getShader(gl, "shader-fs");
+        var vertexShader = getShader(gl, "shader-vs");
+
+        shaderProgram = gl.createProgram();
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS))
+        {
+		console.log("failed to link program: " + gl.getProgramInfoLog(shaderProgram));
+		alert("Error - could not initialize shaders.");
+		return;
+        }
+
+        gl.useProgram(shaderProgram);
+
+        shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "a_position");
+        gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+		
+		shaderProgram.vertexNormalAttribute = gl.getAttribLocation(shaderProgram, "a_normal");
+        gl.enableVertexAttribArray(shaderProgram.vertexNormalAttribute);
+
+		shaderProgram.colorUniform = gl.getUniformLocation(shaderProgram, "u_color");
+        shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "uPMatrix");
+        shaderProgram.mvMatrixUniform = gl.getUniformLocation(shaderProgram, "uMVMatrix");
+    }
+
+	//*******************************************************************************************
+	//end initialization stuff
+
+
+
+	var viewMatrix = mat4.create();				mat4.identity(viewMatrix);
+	var projectionMatrix = mat4.create();		mat4.identity(projectionMatrix);
+
+	//Calculates a modelview matrix and uploads it to the GPU, along with the projection matrix.
+	function setMatrixUniforms(modelMatrix)
+	{
+		var mvMat = mat4.create();
+		mat4.multiply(viewMatrix, modelMatrix, mvMat);
+
+		gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, projectionMatrix);
+		gl.uniformMatrix4fv(shaderProgram.mvMatrixUniform, false, mvMat);
+	}
+
+	//Sets the viewport and the projection matrix (with a field of view of 45).
+	function initCamera()
+	{
+		gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+		
+		//fov, aspect ratio, near clipping plane, far clipping plane (essentially draw distance), matrix to store in
+		mat4.perspective(45, gl.viewportWidth / gl.viewportHeight, 0.1, 400.0, projectionMatrix);
+	}
+
+	//Renders an individual brick as part of a given BLS object (BLS used for colorset information).
+	function renderBrick(bls, brick)
+	{
+		//create this brick's model matrix
+		var modelMatrix = mat4.create();
+		mat4.identity(modelMatrix);
+		
+		mat4.translate(modelMatrix, brick.position);
+		mat4.rotate(modelMatrix, brick.angleid * (Math.PI/2), [0, 1, 0]);
+		
+		//upload our matrices to the GPU
+		setMatrixUniforms(modelMatrix);
+		
+		//upload this brick's color to the GPU
+		gl.uniform4fv(shaderProgram.colorUniform, bls.colorset[brick.colorid]);
+		
+		gl.bindBuffer(gl.ARRAY_BUFFER, brick.blb.getVBO(gl));
+		//vertexAttribPointer(shaderId, componentsPerAttribute, datatype, normalized, stride (in bytes), offset (in bytes))
+		gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, 3, gl.FLOAT, false, 6*4, 0); //position
+		gl.vertexAttribPointer(shaderProgram.vertexNormalAttribute, 3, gl.FLOAT, false, 6*4, 3*4); //normal
+		
+		gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, brick.blb.getIBO(gl));
+		gl.drawElements(gl.TRIANGLES, brick.blb.indexCount, gl.UNSIGNED_SHORT, 0);
+	}
+
+	//Renders an entire BLS file. Automatically updates the view matrix from the camera variables.
+	function renderBLS(bls)
+	{
+		calcViewMatrix();
+		
+		gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+		for(var i = 0; i < bls.bricks.length; i++)
+		{
+			if(!bls.bricks[i].blb || bls.bricks[i].blb.invalid)
+				continue;
+
+			renderBrick(bls, bls.bricks[i]);
+		}
+	}
+
+	var testBLS;
+	
+	var cameraZoom = 48;
+	var cameraPosition = vec3.create();
+	var camRotX = 10; //rotation on X axis (in degrees)
+	var camRotY = -60; //rotation on Y axis (in degrees)
+	
+	//Calculates the view matrix from the cameraZoom, cameraPosition, camRotX, and camRotY variables.
+	function calcViewMatrix()
+	{
+		mat4.identity(viewMatrix);
+		
+		mat4.translate(viewMatrix, [0, 0, -cameraZoom]);
+		mat4.rotate(viewMatrix, camRotX * (Math.PI/180), [1, 0, 0]);
+		mat4.rotate(viewMatrix, camRotY * (Math.PI/180), [0, 1, 0]);
+		mat4.translate(viewMatrix, [-cameraPosition[0], -cameraPosition[1], -cameraPosition[2]]);
+	}
+	
+    function webGLStart()
+    {
+		var canvas = document.getElementById("webgl-canvas");
+		initGL(canvas);
+		initShaders();
+		
+		setMouseListeners();
+		
+		gl.clearColor(0.0, 0.0, 0.0, 1.0);
+		gl.enable(gl.DEPTH_TEST);
+		
+		initCamera();
+
+		testBLS = getBLS("test_big.bls");
+		
+		vec3.set(testBLS.center, cameraPosition);
+
+		renderBLS(testBLS);
+    }
+
+	var lastX = 0;
+	var lastY = 0;
+	var dragging = false;
+	var panMode = false;
+	var firstPersonMode = false;
+	var firstPersonReturnZoom = 0;
+	function setMouseListeners()
+	{
+		//eat the context menu
+		document.oncontextmenu = function()
+		{
+			return false;
+		};
+		
+		$('#webgl-canvas').mousedown(function (e)
+		{
+			if(e.button == 2)
+			{
+				panMode = true;
+			}else{
+				panMode = false;
+				
+				if(e.ctrlKey)
+				{
+					//switch to virst person mode
+					//(which means moving cameraPosition to be where the camera would be with zoom so we can use no zoom)
+					firstPersonMode = true;
+					
+					var mat = mat4.create();
+					mat4.identity(mat);
+					mat4.rotate(mat, camRotX * (Math.PI/180), [1, 0, 0]);
+					mat4.rotate(mat, camRotY * (Math.PI/180), [0, 1, 0]);
+					mat4.inverse(mat);
+					
+					var forward = vec3.createFrom(0, 0, 1);
+					
+					mat4.multiplyVec3(mat, forward, forward);
+					vec3.normalize(forward);
+					vec3.scale(forward, cameraZoom); //note the negative here; flips it so drag left = move right (as you'd expect)
+					
+					vec3.add(cameraPosition, forward);
+					
+					firstPersonReturnZoom = cameraZoom;
+					cameraZoom = 0;
+				}
+			}
+			
+			lastX = e.pageX;
+			lastY = e.pageY;
+			
+			dragging = true;
+			
+			return false;
+		});
+		
+		$('body').mouseup(function (e)
+		{
+			if(firstPersonMode)
+			{
+				firstPersonMode = false;
+				
+				//move cameraPosition back by the original value cameraZoom along the new forward vector and restore cameraZoom
+				var mat = mat4.create();
+				mat4.identity(mat);
+				mat4.rotate(mat, camRotX * (Math.PI/180), [1, 0, 0]);
+				mat4.rotate(mat, camRotY * (Math.PI/180), [0, 1, 0]);
+				mat4.inverse(mat);
+				
+				var forward = vec3.createFrom(0, 0, 1);
+				
+				mat4.multiplyVec3(mat, forward, forward);
+				vec3.normalize(forward);
+				vec3.scale(forward, firstPersonReturnZoom);
+				
+				vec3.subtract(cameraPosition, forward);
+				cameraZoom = firstPersonReturnZoom;
+			}
+			
+			dragging = false;
+		});
+		
+		$('#webgl-canvas').mousemove(function (e)
+		{
+			if(!dragging)
+				return;
+				
+			var deltaX = e.pageX - lastX;
+			var deltaY = e.pageY - lastY;
+			
+			if(panMode)
+			{	
+				//complicated matrix math ahead
+				//basically, we build an identity matrix, rotate it like our camera is,
+				//invert it, then multiply it by normal right and up vectors.
+				//we then scale the result by deltaX and add it to our camera's position.
+				var mat = mat4.create();
+				mat4.identity(mat);
+				mat4.rotate(mat, camRotX * (Math.PI/180), [1, 0, 0]);
+				mat4.rotate(mat, camRotY * (Math.PI/180), [0, 1, 0]);
+				mat4.inverse(mat);
+				
+				var right = vec3.createFrom(1, 0, 0);
+				var up = vec3.createFrom(0, 1, 0);
+				
+				mat4.multiplyVec3(mat, right, right);
+				vec3.normalize(right);
+				vec3.scale(right, -deltaX * 0.05); //note the negative here; flips it so drag left = move right (as you'd expect)
+				
+				mat4.multiplyVec3(mat, up, up);
+				vec3.normalize(up);
+				vec3.scale(up, deltaY * 0.05); //no negative here because y coordinates are always backwards already (in the range of 0, -height)
+				
+				vec3.add(cameraPosition, right);
+				vec3.add(cameraPosition, up);
+				
+			}else{
+				//reduce deltas in first person mode (a little smoother)
+				if(firstPersonMode)
+				{
+					deltaX *= 0.5;
+					deltaY *= 0.5;
+				}
+			
+				//rotate mode
+				camRotY += deltaX * 0.45;
+				camRotX += deltaY * 0.45;
+			}
+			
+			//redraw the scene with our new camera position/orientation
+			renderBLS(testBLS);
+			
+			lastX = e.pageX;
+			lastY = e.pageY;
+		});
+		
+		//gets the wheel delta value from a mousewheel event; differs by browser
+		function extractDelta(e)
+		{
+			if (e.wheelDelta)   return e.wheelDelta;
+			if (e.detail)       return e.detail * -40;
+			if (e.originalEvent && e.originalEvent.wheelDelta)
+								return e.originalEvent.wheelDelta;
+		}
+		
+		//zoom
+		$('#webgl-canvas').bind('mousewheel DOMMouseScroll', function (e)
+		{
+			var delta = extractDelta(e);
+			var deltaSign = delta / 120;
+
+			cameraZoom -= deltaSign * 2;
+
+			renderBLS(testBLS);
+			
+			return false;
+		});
+
+	}
+
+</script>
+
+
+</head>
+
+
+<body onload="webGLStart();">
+    <canvas id="webgl-canvas" style="border: none;" width="800" height="800"></canvas>
+    <br/>
+</body>
+
+</html>
